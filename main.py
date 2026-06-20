@@ -4,6 +4,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import can
+import can.interfaces.pcan
 import time
 import threading
 import json
@@ -851,14 +852,17 @@ class DM1SimulatorGUI:
             self.send_count = 0
             self.send_count_label.config(text="Отправлено: 0")
             self.update_send_count()
+            self.sa_combo.config(state="disabled")
         else:
             messagebox.showerror("Ошибка", "Не удалось запустить отправку")
+            self.sa_combo.config(state="enabled")
     
     def stop_sending(self):
         self.simulator.stop_sending()
         self.start_btn.config(text="Старт")
         self.status_label.config(text="● Остановлен", foreground="red")
         self.status_bar.config(text="Отправка остановлена")
+        self.sa_combo.config(state="enabled")
     
     def update_send_count(self):
         if self.simulator.send_thread_running:
