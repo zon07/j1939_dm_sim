@@ -1,505 +1,20 @@
-# dm1_simulator.py
-"""Имитатор ошибок DM1 для PCAN"""
+# main.py
+"""DM1 Simulator - Главное приложение"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import can
-import can.interfaces.pcan
-import time
-import threading
-import json
 import os
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Tuple
+from typing import Dict
+
+from dtc import DTC
+from simulator import DM1Simulator, ConfigManager, build_can_id, J1939_PGN_DM1
+from gui_widgets import LampBitCheckboxes
+from help_text import HELP_TEXT, ABOUT_TEXT
 
 # Версия программы
 VERSION = "1.2.1"
-
-# Конфигурация
-J1939_PGN_DM1 = 0xFECA
-J1939_PGN_TP_CM = 0xECFF
-J1939_PGN_TP_DT = 0xEBFF
-J1939_PRIORITY = 6
-CAN_SEND_INTERVAL_MS = 1000
-TP_DT_INTERVAL_MS = 200
 DEFAULT_SAVE_FILE = "dtc_list.json"
-
-
-@dataclass
-class DTC:
-    """Diagnostic Trouble Code"""
-    spn: int
-    fmi: int
-    enabled: bool = True  # Флаг включения/отключения ошибки
-    
-    def to_bytes(self) -> bytes:
-        """Преобразование в 4 байта DM1"""
-        spn_lsb = self.spn & 0xFF
-        spn_mid = (self.spn >> 8) & 0xFF
-        spn_msb = (self.spn >> 16) & 0x07
-        fmi_byte = (spn_msb << 5) | (self.fmi & 0x1F)
-        return bytes([spn_lsb, spn_mid, fmi_byte, 0xFF])
-    
-    def to_dict(self) -> dict:
-        return {"spn": self.spn, "fmi": self.fmi, "enabled": self.enabled}
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> 'DTC':
-        return cls(
-            spn=data["spn"], 
-            fmi=data["fmi"],
-            enabled=data.get("enabled", True)  # Обратная совместимость
-        )
-
-
-def build_can_id(pgn: int, sa: int) -> int:
-    return (J1939_PRIORITY << 26) | (pgn << 8) | (sa & 0xFF)
-
-
-class DM1Simulator:
-    """Имитатор отправки DM1 сообщений"""
-    
-    def __init__(self):
-        self.bus = None
-        self.connected = False
-        self.current_sa = None
-        self.dtc_list: List[DTC] = []
-        self.send_thread_running = False
-        self.send_thread = None
-        self.lock = threading.Lock()
-        self.errors_enabled = True
-        
-        # Лампочки (первые 2 байта DM1)
-        self.lamp_status = {
-            'MIL_L': 3,
-            'RSL_L': 3,
-            'AWL_L': 3,
-            'PL_L': 3,
-            'MIL_F': 3,
-            'RSL_F': 3,
-            'AWL_F': 3,
-            'PL_F': 3
-        }
-    
-    def set_lamp_value(self, lamp_name: str, value: int):
-        if lamp_name in self.lamp_status and 0 <= value <= 3:
-            self.lamp_status[lamp_name] = value
-    
-    def get_lamp_bytes(self) -> tuple:
-        byte0 = 0
-        byte0 |= (self.lamp_status['MIL_L'] & 0x03) << 6
-        byte0 |= (self.lamp_status['RSL_L'] & 0x03) << 4
-        byte0 |= (self.lamp_status['AWL_L'] & 0x03) << 2
-        byte0 |= (self.lamp_status['PL_L'] & 0x03) << 0
-        
-        byte1 = 0
-        byte1 |= (self.lamp_status['MIL_F'] & 0x03) << 6
-        byte1 |= (self.lamp_status['RSL_F'] & 0x03) << 4
-        byte1 |= (self.lamp_status['AWL_F'] & 0x03) << 2
-        byte1 |= (self.lamp_status['PL_F'] & 0x03) << 0
-        
-        return byte0, byte1
-    
-    def set_lamp_status_from_dict(self, lamp_data: dict):
-        """Установка значений лампочек из словаря"""
-        for key, value in lamp_data.items():
-            if key in self.lamp_status and 0 <= value <= 3:
-                self.lamp_status[key] = value
-    
-    def connect(self, channel: str, bitrate: int) -> bool:
-        try:
-            self.bus = can.interface.Bus(
-                interface='pcan',
-                channel=channel,
-                bitrate=bitrate
-            )
-            self.connected = True
-            return True
-        except Exception as e:
-            print(f"Ошибка подключения: {e}")
-            return False
-    
-    def disconnect(self):
-        self.send_thread_running = False
-        if self.send_thread:
-            self.send_thread.join(timeout=1)
-            self.send_thread = None
-        
-        if self.bus:
-            try:
-                self.bus.shutdown()
-            except:
-                pass
-            self.bus = None
-        
-        self.connected = False
-        print("CAN отключен")
-    
-    def set_sa(self, sa: int):
-        self.current_sa = sa
-    
-    def set_dtc_list(self, dtc_list: List[DTC]):
-        with self.lock:
-            self.dtc_list = dtc_list.copy()
-    
-    def add_dtc(self, spn: int, fmi: int) -> Tuple[bool, str]:
-        with self.lock:
-            if len(self.dtc_list) >= 445:
-                return False, "Достигнут максимум ошибок (445)"
-            
-            for dtc in self.dtc_list:
-                if dtc.spn == spn and dtc.fmi == fmi:
-                    return False, f"Ошибка SPN={spn}, FMI={fmi} уже существует"
-            
-            self.dtc_list.append(DTC(spn=spn, fmi=fmi))
-            # Сортируем список после добавления
-            self._sort_dtc_list()
-            return True, "OK"
-    
-    def _sort_dtc_list(self):
-        """Сортировка списка ошибок по SPN, затем по FMI"""
-        self.dtc_list.sort(key=lambda x: (x.spn, x.fmi))
-    
-    def remove_dtc(self, index: int) -> bool:
-        with self.lock:
-            if 0 <= index < len(self.dtc_list):
-                del self.dtc_list[index]
-                return True
-            return False
-    
-    def clear_dtc(self):
-        with self.lock:
-            self.dtc_list.clear()
-    
-    def set_errors_enabled(self, enabled: bool):
-        self.errors_enabled = enabled
-    
-    def toggle_dtc_enabled(self, index: int) -> bool:
-        """Включить/выключить конкретную ошибку"""
-        with self.lock:
-            if 0 <= index < len(self.dtc_list):
-                self.dtc_list[index].enabled = not self.dtc_list[index].enabled
-                return True
-            return False
-    
-    def start_sending(self):
-        if not self.connected or self.current_sa is None:
-            return False
-        
-        if self.send_thread_running:
-            return True
-        
-        self.send_thread_running = True
-        self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
-        self.send_thread.start()
-        return True
-    
-    def stop_sending(self):
-        self.send_thread_running = False
-    
-    def _send_loop(self):
-        while self.send_thread_running and self.connected:
-            start_time = time.time()
-            
-            try:
-                self._send_current_dm1()
-            except Exception as e:
-                print(f"Ошибка отправки: {e}")
-            
-            elapsed = time.time() - start_time
-            sleep_time = max(0, CAN_SEND_INTERVAL_MS / 1000.0 - elapsed)
-            if sleep_time > 0 and self.send_thread_running:
-                time.sleep(sleep_time)
-    
-    def _send_current_dm1(self):
-        with self.lock:
-            # Берем только включенные ошибки
-            dtc_list = [dtc for dtc in self.dtc_list if dtc.enabled]
-        
-        if not self.errors_enabled or not dtc_list:
-            self._send_dm1_single(0, 0)
-        elif len(dtc_list) == 1:
-            dtc = dtc_list[0]
-            self._send_dm1_single(dtc.spn, dtc.fmi)
-        else:
-            self._send_dm1_bam(dtc_list)
-    
-    def _send_dm1_single(self, spn: int, fmi: int):
-        if not self.bus:
-            return
-        
-        lamp_byte0, lamp_byte1 = self.get_lamp_bytes()
-        
-        # Если SPN=0 и FMI=0, то байт 0 = 0x00, байт 1 = 0xFF
-        if spn == 0 and fmi == 0:
-            lamp_byte0 = 0x00
-            lamp_byte1 = 0xFF
-        
-        spn_lsb = spn & 0xFF
-        spn_mid = (spn >> 8) & 0xFF
-        spn_msb = (spn >> 16) & 0x07
-        fmi_byte = (spn_msb << 5) | (fmi & 0x1F)
-        
-        data = bytearray(8)
-        data[0] = lamp_byte0
-        data[1] = lamp_byte1
-        data[2] = spn_lsb
-        data[3] = spn_mid
-        data[4] = fmi_byte
-        data[5] = 0xFF
-        data[6] = 0xFF
-        data[7] = 0xFF
-        
-        can_id = build_can_id(J1939_PGN_DM1, self.current_sa)
-        
-        msg = can.Message(
-            arbitration_id=can_id,
-            data=bytes(data),
-            is_extended_id=True,
-            dlc=8
-        )
-        
-        try:
-            self.bus.send(msg)
-            print(f"DM1: ID=0x{can_id:08X}, SPN={spn}, FMI={fmi}, Lamps=0x{lamp_byte0:02X}{lamp_byte1:02X}")
-        except Exception as e:
-            print(f"Ошибка отправки DM1: {e}")
-    
-    def _send_dm1_bam(self, dtc_list: List[DTC]):
-        if not self.bus:
-            return
-        
-        lamp_byte0, lamp_byte1 = self.get_lamp_bytes()
-        
-        data = bytearray(2)
-        data[0] = lamp_byte0
-        data[1] = lamp_byte1
-        
-        for dtc in dtc_list:
-            data.extend(dtc.to_bytes())
-        
-        if len(data) > 1785:
-            data = data[:1785]
-            print(f"⚠️ Данные обрезаны до 1785 байт")
-        
-        total_bytes = len(data)
-        total_packets = (total_bytes + 6) // 7
-        
-        self._send_tp_cm(total_bytes, total_packets)
-        
-        packet_number = 1
-        for i in range(0, total_bytes, 7):
-            chunk = data[i:i+7]
-            self._send_tp_dt(packet_number, chunk)
-            packet_number += 1
-            if i + 7 < total_bytes:
-                time.sleep(TP_DT_INTERVAL_MS / 1000.0)
-        
-        print(f"BAM отправлен: {len(dtc_list)} ошибок, {total_packets} пакетов")
-    
-    def _send_tp_cm(self, total_bytes: int, total_packets: int):
-        data = bytearray(8)
-        data[0] = 0x20
-        data[1] = total_bytes & 0xFF
-        data[2] = (total_bytes >> 8) & 0xFF
-        data[3] = total_packets & 0xFF
-        data[4] = 0xFF
-        data[5] = J1939_PGN_DM1 & 0xFF
-        data[6] = (J1939_PGN_DM1 >> 8) & 0xFF
-        data[7] = (J1939_PGN_DM1 >> 16) & 0xFF
-        
-        can_id = build_can_id(J1939_PGN_TP_CM, self.current_sa)
-        
-        msg = can.Message(
-            arbitration_id=can_id,
-            data=bytes(data),
-            is_extended_id=True,
-            dlc=8
-        )
-        
-        try:
-            self.bus.send(msg)
-            print(f"TP.CM: ID=0x{can_id:08X}, bytes={total_bytes}, packets={total_packets}")
-        except Exception as e:
-            print(f"Ошибка отправки TP.CM: {e}")
-    
-    def _send_tp_dt(self, packet_number: int, data: bytes):
-        packet_data = bytearray(8)
-        packet_data[0] = packet_number & 0xFF
-        
-        for i, byte in enumerate(data[:7]):
-            packet_data[i + 1] = byte
-        
-        for i in range(len(data) + 1, 8):
-            packet_data[i] = 0xFF
-        
-        can_id = build_can_id(J1939_PGN_TP_DT, self.current_sa)
-        
-        msg = can.Message(
-            arbitration_id=can_id,
-            data=bytes(packet_data),
-            is_extended_id=True,
-            dlc=8
-        )
-        
-        try:
-            self.bus.send(msg)
-        except Exception as e:
-            print(f"Ошибка отправки TP.DT: {e}")
-    
-    def save_to_file(self, filename: str) -> bool:
-        """Сохранение списка ошибок и настроек лампочек в файл JSON"""
-        try:
-            with self.lock:
-                data = {
-                    "dtc_list": [dtc.to_dict() for dtc in self.dtc_list],
-                    "errors_enabled": self.errors_enabled,
-                    "lamp_status": self.lamp_status.copy()
-                }
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            print(f"Ошибка сохранения: {e}")
-            return False
-    
-    def load_from_file(self, filename: str) -> bool:
-        """Загрузка списка ошибок и настроек лампочек из файла JSON"""
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            with self.lock:
-                self.dtc_list = [DTC.from_dict(dtc) for dtc in data.get("dtc_list", [])]
-                self.errors_enabled = data.get("errors_enabled", True)
-                if "lamp_status" in data:
-                    self.set_lamp_status_from_dict(data["lamp_status"])
-                # Сортируем после загрузки
-                self._sort_dtc_list()
-            return True
-        except Exception as e:
-            print(f"Ошибка загрузки: {e}")
-            return False
-
-
-class LampBitCheckboxes:
-    """Виджет для управления лампами через чекбоксы (по 2 бита на лампу)"""
-    
-    def __init__(self, parent, lamp_vars: Dict[str, tk.StringVar], callback):
-        self.parent = parent
-        self.lamp_vars = lamp_vars
-        self.callback = callback
-        self.checkboxes = {}
-        
-        self._create_widgets()
-    
-    def _create_widgets(self):
-        # Байт 0 (L - Status)
-        byte0_frame = ttk.LabelFrame(self.parent, text="Байт 1 (L - Status)", padding="5")
-        byte0_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-        
-        lamps_byte0 = [
-            ('MIL_L', 'MIL'),
-            ('RSL_L', 'RSL'),
-            ('AWL_L', 'AWL'),
-            ('PL_L', 'PL')
-        ]
-        
-        for idx, (lamp_name, label) in enumerate(lamps_byte0):
-            frame = ttk.Frame(byte0_frame)
-            frame.pack(fill=tk.X, pady=2)
-            
-            ttk.Label(frame, text=f"{label}:", width=6).pack(side=tk.LEFT)
-            
-            # Два чекбокса для двух бит
-            var1 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 1))
-            var2 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 0))
-            
-            cb1 = ttk.Checkbutton(frame, variable=var1, text="Бит 1", 
-                                 command=lambda n=lamp_name, v=var1, pos=1: self._on_checkbox_change(n, v, pos))
-            cb1.pack(side=tk.LEFT, padx=2)
-            
-            cb2 = ttk.Checkbutton(frame, variable=var2, text="Бит 0", 
-                                 command=lambda n=lamp_name, v=var2, pos=0: self._on_checkbox_change(n, v, pos))
-            cb2.pack(side=tk.LEFT, padx=2)
-            
-            self.checkboxes[lamp_name] = (var1, var2)
-        
-        # Байт 1 (F - Flash)
-        byte1_frame = ttk.LabelFrame(self.parent, text="Байт 2 (F - Flash)", padding="5")
-        byte1_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-        
-        lamps_byte1 = [
-            ('MIL_F', 'MIL'),
-            ('RSL_F', 'RSL'),
-            ('AWL_F', 'AWL'),
-            ('PL_F', 'PL')
-        ]
-        
-        for idx, (lamp_name, label) in enumerate(lamps_byte1):
-            frame = ttk.Frame(byte1_frame)
-            frame.pack(fill=tk.X, pady=2)
-            
-            ttk.Label(frame, text=f"{label}:", width=6).pack(side=tk.LEFT)
-            
-            var1 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 1))
-            var2 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 0))
-            
-            cb1 = ttk.Checkbutton(frame, variable=var1, text="Бит 1",
-                                 command=lambda n=lamp_name, v=var1, pos=1: self._on_checkbox_change(n, v, pos))
-            cb1.pack(side=tk.LEFT, padx=2)
-            
-            cb2 = ttk.Checkbutton(frame, variable=var2, text="Бит 0",
-                                 command=lambda n=lamp_name, v=var2, pos=0: self._on_checkbox_change(n, v, pos))
-            cb2.pack(side=tk.LEFT, padx=2)
-            
-            self.checkboxes[lamp_name] = (var1, var2)
-    
-    def _get_bit_value(self, lamp_name: str, bit_pos: int) -> bool:
-        """Получить значение бита для лампы"""
-        value_str = self.lamp_vars[lamp_name].get()
-        if value_str.startswith("0b"):
-            value = int(value_str[2:], 2)
-        else:
-            try:
-                value = int(value_str)
-            except ValueError:
-                value = 3
-        return bool((value >> bit_pos) & 1)
-    
-    def _on_checkbox_change(self, lamp_name: str, var: tk.BooleanVar, bit_pos: int):
-        """Обработчик изменения чекбокса"""
-        value_str = self.lamp_vars[lamp_name].get()
-        if value_str.startswith("0b"):
-            value = int(value_str[2:], 2)
-        else:
-            try:
-                value = int(value_str)
-            except ValueError:
-                value = 3
-        
-        if var.get():
-            value |= (1 << bit_pos)
-        else:
-            value &= ~(1 << bit_pos)
-        
-        self.lamp_vars[lamp_name].set(f"0b{value:02b}")
-        self.callback()
-    
-    def update_checkboxes_from_values(self):
-        """Обновить состояние чекбоксов из текущих значений lamp_vars"""
-        for lamp_name in self.lamp_vars:
-            var1, var2 = self.checkboxes[lamp_name]
-            value_str = self.lamp_vars[lamp_name].get()
-            if value_str.startswith("0b"):
-                value = int(value_str[2:], 2)
-            else:
-                try:
-                    value = int(value_str)
-                except ValueError:
-                    value = 3
-            var1.set(bool((value >> 1) & 1))
-            var2.set(bool((value >> 0) & 1))
 
 
 class DM1SimulatorGUI:
@@ -507,17 +22,24 @@ class DM1SimulatorGUI:
     
     def __init__(self, root: tk.Tk):
         self.root = root
+        
+        # Загружаем конфигурацию
+        self.config = ConfigManager.load_config()
+        
+        # Устанавливаем геометрию окна из конфига
+        geometry = self.config.get("window_geometry", "610x800+100+50")
+        self.root.geometry(geometry)
+        
         self.root.title(f"DM1 Simulator - PCAN v{VERSION}")
-        self.root.geometry("600x800+100+50")
         self.root.minsize(300, 350)
         self.root.resizable(True, True)
         
         self.simulator = DM1Simulator()
         
         # Переменные
-        self.selected_channel = tk.StringVar()
-        self.selected_sa = tk.StringVar(value="0x00")
-        self.selected_bitrate = tk.StringVar(value="250000")
+        self.selected_channel = tk.StringVar(value=self.config.get("last_channel", ""))
+        self.selected_sa = tk.StringVar(value=self.config.get("last_sa", "0x00"))
+        self.selected_bitrate = tk.StringVar(value=self.config.get("last_bitrate", "250000"))
         self.spn_var = tk.StringVar(value="0")
         self.fmi_var = tk.StringVar(value="0")
         
@@ -533,9 +55,119 @@ class DM1SimulatorGUI:
             'PL_F': tk.StringVar(value="0b11")
         }
         
+        # Создаем меню
+        self.create_menu()
+        
         self.create_widgets()
         self.scan_channels()
         self.load_default_file()
+        
+        # Привязываем событие изменения размера окна
+        self.root.bind("<Configure>", self.on_window_resize)
+    
+    def create_menu(self):
+        """Создание главного меню"""
+        menubar = tk.Menu(        self.root,
+        bg='#f0f0f0',                   # Фон меню
+        fg='#000000',                   # Цвет текста
+        activebackground='#cce8ff',     # Фон при наведении
+        activeforeground='#000000',     # Цвет текста при наведении
+        relief='raised',                  # Рельеф (приподнятое)
+        bd=1,                             # Толщина рамки
+        borderwidth=1)
+        self.root.config(menu=menubar)
+        
+        # Меню "Справка"
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Справка", menu=help_menu)
+        help_menu.add_command(label="Помощь", command=self.show_help)
+        help_menu.add_separator()
+        help_menu.add_command(label="О программе", command=self.show_about)
+    
+    def show_help(self):
+        """Показать окно помощи"""
+        help_window = tk.Toplevel(self.root)
+        help_window.title("Помощь")
+        help_window.geometry("550x500+200+100")
+        help_window.minsize(400, 300)
+        
+        # Фрейм с прокруткой
+        frame = ttk.Frame(help_window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text_widget = tk.Text(frame, wrap=tk.WORD, yscrollcommand=scrollbar.set, font=("Segoe UI", 10))
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+        
+        text_widget.insert("1.0", HELP_TEXT)
+        text_widget.config(state=tk.DISABLED)
+        
+        # Функция копирования
+        def copy_text():
+            try:
+                text_widget.clipboard_clear()
+                text_widget.clipboard_append(text_widget.selection_get())
+            except tk.TclError:
+                pass
+        
+        # Контекстное меню
+        def show_context_menu(event):
+            context_menu.post(event.x_root, event.y_root)
+        
+        context_menu = tk.Menu(help_window, tearoff=0)
+        context_menu.add_command(label="Копировать", command=copy_text)
+        text_widget.bind("<Button-3>", show_context_menu)
+        
+        # Горячие клавиши для копирования (работает с любой раскладкой)
+        text_widget.bind("<Control-c>", lambda e: copy_text())
+        text_widget.bind("<Control-C>", lambda e: copy_text())  # Для Caps Lock
+        text_widget.bind("<Control-с>", lambda e: copy_text())  # Русская 'с' (строчная)
+        text_widget.bind("<Control-С>", lambda e: copy_text())  # Русская 'С' (заглавная)
+        
+        # Кнопка закрыть
+        btn_frame = ttk.Frame(help_window)
+        btn_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(btn_frame, text="Закрыть", command=help_window.destroy, width=15).pack()
+    
+    def show_about(self):
+        """Показать окно 'О программе'"""
+        about_window = tk.Toplevel(self.root)
+        about_window.title("О программе")
+        about_window.geometry("350x250+300+200")
+        about_window.resizable(False, False)
+        
+        # Основной фрейм
+        frame = ttk.Frame(about_window, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Название
+        title_label = ttk.Label(frame, text="DM1 Simulator", font=("Segoe UI", 16, "bold"))
+        title_label.pack(pady=(0, 5))
+        
+        # Версия
+        version_label = ttk.Label(frame, text=f"Версия {VERSION}", font=("Segoe UI", 10))
+        version_label.pack(pady=(0, 5))
+        
+        # Разделитель
+        ttk.Separator(frame, orient="horizontal").pack(fill=tk.X, pady=5)
+        
+        # Описание
+        desc_label = ttk.Label(frame, text=ABOUT_TEXT, justify=tk.LEFT, font=("Segoe UI", 9))
+        desc_label.pack(pady=5)
+        
+        # Кнопка закрыть
+        ttk.Button(frame, text="OK", command=about_window.destroy, width=15).pack(pady=10)
+    
+    def on_window_resize(self, event=None):
+        """Сохраняем геометрию окна при изменении"""
+        if event and event.widget == self.root:
+            # Сохраняем только если окно видимо и не свернуто
+            if self.root.winfo_viewable():
+                geometry = self.root.geometry()
+                self.config["window_geometry"] = geometry
     
     def create_widgets(self):
         """Создание виджетов"""
@@ -575,7 +207,7 @@ class DM1SimulatorGUI:
         sa_values = [f"0x{i:02X}" for i in range(256)]
         self.sa_combo = ttk.Combobox(row2, textvariable=self.selected_sa, values=sa_values, width=8, state="readonly")
         self.sa_combo.pack(side=tk.LEFT, padx=5)
-        self.sa_combo.set("0x00")
+        self.sa_combo.set(self.config.get("last_sa", "0x00"))
         
         ttk.Label(row2, text="Пример ID:").pack(side=tk.LEFT, padx=(20, 5))
         self.id_example_label = ttk.Label(row2, text="0x18FECA00", foreground="blue", font=("Courier", 10, "bold"))
@@ -701,7 +333,7 @@ class DM1SimulatorGUI:
         self.update_lamp_preview()
     
     def reset_lamps(self):
-        """Сброс всех лампочек в значение 3 (FF)"""
+        """Сброс всех лампочек в значение 0"""
         for key in self.lamp_vars:
             self.lamp_vars[key].set("0b00")
         # Обновляем чекбоксы
@@ -860,7 +492,11 @@ class DM1SimulatorGUI:
         
         if channels:
             self.channel_combo['values'] = channels
-            self.selected_channel.set(channels[0])
+            # Если сохраненный канал есть в списке, выбираем его
+            if self.selected_channel.get() in channels:
+                self.channel_combo.set(self.selected_channel.get())
+            else:
+                self.selected_channel.set(channels[0])
         else:
             self.channel_combo['values'] = []
             self.status_bar.config(text="❌ Нет PCAN устройств")
@@ -884,6 +520,9 @@ class DM1SimulatorGUI:
             self.status_bar.config(text=f"✅ Подключено к {channel}")
             self.start_btn.config(state=tk.NORMAL)
             self.update_id_example()
+            # Сохраняем последний канал и битрейт
+            self.config["last_channel"] = channel
+            self.config["last_bitrate"] = str(bitrate)
         else:
             messagebox.showerror("Ошибка", "Не удалось подключиться")
     
@@ -907,6 +546,9 @@ class DM1SimulatorGUI:
                 sa = int(sa_str, 16)
                 self.simulator.set_sa(sa)
                 self.status_bar.config(text=f"SA: {sa_str}")
+        
+        # Сохраняем выбранный SA
+        self.config["last_sa"] = self.selected_sa.get()
     
     def update_id_example(self):
         sa_str = self.selected_sa.get()
@@ -1038,6 +680,11 @@ class DM1SimulatorGUI:
         self.update_errors_status()
     
     def on_closing(self):
+        # Сохраняем геометрию перед закрытием
+        geometry = self.root.geometry()
+        self.config["window_geometry"] = geometry
+        ConfigManager.save_config(self.config)
+        
         self.simulator.save_to_file(DEFAULT_SAVE_FILE)
         self.simulator.stop_sending()
         self.simulator.disconnect()
