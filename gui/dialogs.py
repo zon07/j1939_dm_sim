@@ -37,14 +37,18 @@ class HelpDialog:
         def show_context_menu(event):
             context_menu.post(event.x_root, event.y_root)
         
+        def on_ctrl_key(event):
+            KEY_C = 67 # keycode 67 - это физическая клавиша 'C' (независимо от раскладки)
+            if event.keycode == 67 and event.state & 0x4:  # 0x4 = Control
+                copy_text()
+            return "break"
+        
         context_menu = tk.Menu(self.window, tearoff=0)
         context_menu.add_command(label="Копировать", command=copy_text)
         text_widget.bind("<Button-3>", show_context_menu)
-        text_widget.bind("<Control-c>", lambda e: copy_text())
-        text_widget.bind("<Control-C>", lambda e: copy_text())
-        text_widget.bind("<Control-с>", lambda e: copy_text())
-        text_widget.bind("<Control-С>", lambda e: copy_text())
-        
+        text_widget.bind("<Control-Key>", on_ctrl_key)
+
+
         btn_frame = ttk.Frame(self.window)
         btn_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(btn_frame, text="Закрыть", command=self.window.destroy, width=15).pack()
