@@ -3,7 +3,7 @@
 import tkinter as tk
 from app import DM1SimulatorApp
 
-VERSION = "1.2.1"
+VERSION = "1.1.0"
 
 def main():
     root = tk.Tk()
