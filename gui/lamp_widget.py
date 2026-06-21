@@ -1,5 +1,4 @@
-# gui_widgets.py
-"""Виджеты для GUI DM1 симулятора"""
+"""Виджет для управления лампами через чекбоксы"""
 
 import tkinter as tk
 from tkinter import ttk
@@ -35,7 +34,6 @@ class LampBitCheckboxes:
             
             ttk.Label(frame, text=f"{label}:", width=6).pack(side=tk.LEFT)
             
-            # Два чекбокса для двух бит
             var1 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 1))
             var2 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 0))
             
@@ -80,7 +78,6 @@ class LampBitCheckboxes:
             self.checkboxes[lamp_name] = (var1, var2)
     
     def _get_bit_value(self, lamp_name: str, bit_pos: int) -> bool:
-        """Получить значение бита для лампы"""
         value_str = self.lamp_vars[lamp_name].get()
         if value_str.startswith("0b"):
             value = int(value_str[2:], 2)
@@ -92,7 +89,6 @@ class LampBitCheckboxes:
         return bool((value >> bit_pos) & 1)
     
     def _on_checkbox_change(self, lamp_name: str, var: tk.BooleanVar, bit_pos: int):
-        """Обработчик изменения чекбокса"""
         value_str = self.lamp_vars[lamp_name].get()
         if value_str.startswith("0b"):
             value = int(value_str[2:], 2)
@@ -111,7 +107,6 @@ class LampBitCheckboxes:
         self.callback()
     
     def update_checkboxes_from_values(self):
-        """Обновить состояние чекбоксов из текущих значений lamp_vars"""
         for lamp_name in self.lamp_vars:
             var1, var2 = self.checkboxes[lamp_name]
             value_str = self.lamp_vars[lamp_name].get()

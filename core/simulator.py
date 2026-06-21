@@ -9,7 +9,7 @@ import os
 from typing import List, Optional, Dict, Tuple
 from dataclasses import asdict
 
-from dtc import DTC
+from core.dtc import DTC
 
 
 # Конфигурация
