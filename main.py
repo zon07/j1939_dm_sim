@@ -10,10 +10,10 @@ import threading
 import json
 import os
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 # Версия программы
-VERSION = "1.0.0"
+VERSION = "1.2.1"
 
 # Конфигурация
 J1939_PGN_DM1 = 0xFECA
@@ -30,6 +30,7 @@ class DTC:
     """Diagnostic Trouble Code"""
     spn: int
     fmi: int
+    enabled: bool = True  # Флаг включения/отключения ошибки
     
     def to_bytes(self) -> bytes:
         """Преобразование в 4 байта DM1"""
@@ -40,11 +41,15 @@ class DTC:
         return bytes([spn_lsb, spn_mid, fmi_byte, 0xFF])
     
     def to_dict(self) -> dict:
-        return {"spn": self.spn, "fmi": self.fmi}
+        return {"spn": self.spn, "fmi": self.fmi, "enabled": self.enabled}
     
     @classmethod
     def from_dict(cls, data: dict) -> 'DTC':
-        return cls(spn=data["spn"], fmi=data["fmi"])
+        return cls(
+            spn=data["spn"], 
+            fmi=data["fmi"],
+            enabled=data.get("enabled", True)  # Обратная совместимость
+        )
 
 
 def build_can_id(pgn: int, sa: int) -> int:
@@ -137,7 +142,7 @@ class DM1Simulator:
         with self.lock:
             self.dtc_list = dtc_list.copy()
     
-    def add_dtc(self, spn: int, fmi: int):
+    def add_dtc(self, spn: int, fmi: int) -> Tuple[bool, str]:
         with self.lock:
             if len(self.dtc_list) >= 445:
                 return False, "Достигнут максимум ошибок (445)"
@@ -147,9 +152,15 @@ class DM1Simulator:
                     return False, f"Ошибка SPN={spn}, FMI={fmi} уже существует"
             
             self.dtc_list.append(DTC(spn=spn, fmi=fmi))
+            # Сортируем список после добавления
+            self._sort_dtc_list()
             return True, "OK"
     
-    def remove_dtc(self, index: int):
+    def _sort_dtc_list(self):
+        """Сортировка списка ошибок по SPN, затем по FMI"""
+        self.dtc_list.sort(key=lambda x: (x.spn, x.fmi))
+    
+    def remove_dtc(self, index: int) -> bool:
         with self.lock:
             if 0 <= index < len(self.dtc_list):
                 del self.dtc_list[index]
@@ -162,6 +173,14 @@ class DM1Simulator:
     
     def set_errors_enabled(self, enabled: bool):
         self.errors_enabled = enabled
+    
+    def toggle_dtc_enabled(self, index: int) -> bool:
+        """Включить/выключить конкретную ошибку"""
+        with self.lock:
+            if 0 <= index < len(self.dtc_list):
+                self.dtc_list[index].enabled = not self.dtc_list[index].enabled
+                return True
+            return False
     
     def start_sending(self):
         if not self.connected or self.current_sa is None:
@@ -194,7 +213,8 @@ class DM1Simulator:
     
     def _send_current_dm1(self):
         with self.lock:
-            dtc_list = self.dtc_list.copy()
+            # Берем только включенные ошибки
+            dtc_list = [dtc for dtc in self.dtc_list if dtc.enabled]
         
         if not self.errors_enabled or not dtc_list:
             self._send_dm1_single(0, 0)
@@ -354,10 +374,132 @@ class DM1Simulator:
                 self.errors_enabled = data.get("errors_enabled", True)
                 if "lamp_status" in data:
                     self.set_lamp_status_from_dict(data["lamp_status"])
+                # Сортируем после загрузки
+                self._sort_dtc_list()
             return True
         except Exception as e:
             print(f"Ошибка загрузки: {e}")
             return False
+
+
+class LampBitCheckboxes:
+    """Виджет для управления лампами через чекбоксы (по 2 бита на лампу)"""
+    
+    def __init__(self, parent, lamp_vars: Dict[str, tk.StringVar], callback):
+        self.parent = parent
+        self.lamp_vars = lamp_vars
+        self.callback = callback
+        self.checkboxes = {}
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        # Байт 0 (L - Status)
+        byte0_frame = ttk.LabelFrame(self.parent, text="Байт 1 (L - Status)", padding="5")
+        byte0_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        
+        lamps_byte0 = [
+            ('MIL_L', 'MIL'),
+            ('RSL_L', 'RSL'),
+            ('AWL_L', 'AWL'),
+            ('PL_L', 'PL')
+        ]
+        
+        for idx, (lamp_name, label) in enumerate(lamps_byte0):
+            frame = ttk.Frame(byte0_frame)
+            frame.pack(fill=tk.X, pady=2)
+            
+            ttk.Label(frame, text=f"{label}:", width=6).pack(side=tk.LEFT)
+            
+            # Два чекбокса для двух бит
+            var1 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 1))
+            var2 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 0))
+            
+            cb1 = ttk.Checkbutton(frame, variable=var1, text="Бит 1", 
+                                 command=lambda n=lamp_name, v=var1, pos=1: self._on_checkbox_change(n, v, pos))
+            cb1.pack(side=tk.LEFT, padx=2)
+            
+            cb2 = ttk.Checkbutton(frame, variable=var2, text="Бит 0", 
+                                 command=lambda n=lamp_name, v=var2, pos=0: self._on_checkbox_change(n, v, pos))
+            cb2.pack(side=tk.LEFT, padx=2)
+            
+            self.checkboxes[lamp_name] = (var1, var2)
+        
+        # Байт 1 (F - Flash)
+        byte1_frame = ttk.LabelFrame(self.parent, text="Байт 2 (F - Flash)", padding="5")
+        byte1_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        
+        lamps_byte1 = [
+            ('MIL_F', 'MIL'),
+            ('RSL_F', 'RSL'),
+            ('AWL_F', 'AWL'),
+            ('PL_F', 'PL')
+        ]
+        
+        for idx, (lamp_name, label) in enumerate(lamps_byte1):
+            frame = ttk.Frame(byte1_frame)
+            frame.pack(fill=tk.X, pady=2)
+            
+            ttk.Label(frame, text=f"{label}:", width=6).pack(side=tk.LEFT)
+            
+            var1 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 1))
+            var2 = tk.BooleanVar(value=self._get_bit_value(lamp_name, 0))
+            
+            cb1 = ttk.Checkbutton(frame, variable=var1, text="Бит 1",
+                                 command=lambda n=lamp_name, v=var1, pos=1: self._on_checkbox_change(n, v, pos))
+            cb1.pack(side=tk.LEFT, padx=2)
+            
+            cb2 = ttk.Checkbutton(frame, variable=var2, text="Бит 0",
+                                 command=lambda n=lamp_name, v=var2, pos=0: self._on_checkbox_change(n, v, pos))
+            cb2.pack(side=tk.LEFT, padx=2)
+            
+            self.checkboxes[lamp_name] = (var1, var2)
+    
+    def _get_bit_value(self, lamp_name: str, bit_pos: int) -> bool:
+        """Получить значение бита для лампы"""
+        value_str = self.lamp_vars[lamp_name].get()
+        if value_str.startswith("0b"):
+            value = int(value_str[2:], 2)
+        else:
+            try:
+                value = int(value_str)
+            except ValueError:
+                value = 3
+        return bool((value >> bit_pos) & 1)
+    
+    def _on_checkbox_change(self, lamp_name: str, var: tk.BooleanVar, bit_pos: int):
+        """Обработчик изменения чекбокса"""
+        value_str = self.lamp_vars[lamp_name].get()
+        if value_str.startswith("0b"):
+            value = int(value_str[2:], 2)
+        else:
+            try:
+                value = int(value_str)
+            except ValueError:
+                value = 3
+        
+        if var.get():
+            value |= (1 << bit_pos)
+        else:
+            value &= ~(1 << bit_pos)
+        
+        self.lamp_vars[lamp_name].set(f"0b{value:02b}")
+        self.callback()
+    
+    def update_checkboxes_from_values(self):
+        """Обновить состояние чекбоксов из текущих значений lamp_vars"""
+        for lamp_name in self.lamp_vars:
+            var1, var2 = self.checkboxes[lamp_name]
+            value_str = self.lamp_vars[lamp_name].get()
+            if value_str.startswith("0b"):
+                value = int(value_str[2:], 2)
+            else:
+                try:
+                    value = int(value_str)
+                except ValueError:
+                    value = 3
+            var1.set(bool((value >> 1) & 1))
+            var2.set(bool((value >> 0) & 1))
 
 
 class DM1SimulatorGUI:
@@ -366,8 +508,8 @@ class DM1SimulatorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"DM1 Simulator - PCAN v{VERSION}")
-        self.root.geometry("650x850")
-        self.root.minsize(250, 280)
+        self.root.geometry("600x800+100+50")
+        self.root.minsize(300, 350)
         self.root.resizable(True, True)
         
         self.simulator = DM1Simulator()
@@ -452,110 +594,20 @@ class DM1SimulatorGUI:
         lamps_frame = ttk.LabelFrame(main_frame, text="DM1 Lamp Status (первые 2 байта)", padding="10")
         lamps_frame.pack(fill=tk.X, pady=5)
         
-        # Заголовки с правильным выравниванием
-        header_frame = ttk.Frame(lamps_frame)
-        header_frame.pack(fill=tk.X, pady=(0, 5))
+        lamps_container = ttk.Frame(lamps_frame)
+        lamps_container.pack(fill=tk.X)
         
-        # Левая часть (Байт 0) - отступ для выравнивания с комбобоксами
-        left_header = ttk.Frame(header_frame)
-        left_header.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(left_header, text="Байт 0 (L - Status)", font=("", 10, "bold"), foreground="blue").pack(anchor=tk.W, padx=(12, 0))
+        self.lamp_widget = LampBitCheckboxes(lamps_container, self.lamp_vars, self.on_lamp_changed)
         
-        # Правая часть (Байт 1) - отступ для выравнивания с комбобоксами
-        right_header = ttk.Frame(header_frame)
-        right_header.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(right_header, text="Байт 1 (F - Flash)", font=("", 10, "bold"), foreground="blue").pack(anchor=tk.W, padx=(12, 0))
-        
-        # Строка 1: MIL
-        lamp_row1 = ttk.Frame(lamps_frame)
-        lamp_row1.pack(fill=tk.X, pady=2)
-        
-        # Левая часть (Байт 0)
-        left_frame = ttk.Frame(lamp_row1)
-        left_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        ttk.Label(left_frame, text="MIL_L (6-7):", width=12).pack(side=tk.LEFT)
-        mil_l_combo = ttk.Combobox(left_frame, textvariable=self.lamp_vars['MIL_L'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        mil_l_combo.pack(side=tk.LEFT, padx=2)
-        mil_l_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        mil_l_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        ttk.Label(left_frame, text="RSL_L (4-5):", width=12).pack(side=tk.LEFT, padx=(10, 2))
-        rsl_l_combo = ttk.Combobox(left_frame, textvariable=self.lamp_vars['RSL_L'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        rsl_l_combo.pack(side=tk.LEFT, padx=2)
-        rsl_l_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        rsl_l_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        # Правая часть (Байт 1)
-        right_frame = ttk.Frame(lamp_row1)
-        right_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        ttk.Label(right_frame, text="MIL_F (6-7):", width=12).pack(side=tk.LEFT)
-        mil_f_combo = ttk.Combobox(right_frame, textvariable=self.lamp_vars['MIL_F'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        mil_f_combo.pack(side=tk.LEFT, padx=2)
-        mil_f_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        mil_f_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        ttk.Label(right_frame, text="RSL_F (4-5):", width=12).pack(side=tk.LEFT, padx=(10, 2))
-        rsl_f_combo = ttk.Combobox(right_frame, textvariable=self.lamp_vars['RSL_F'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        rsl_f_combo.pack(side=tk.LEFT, padx=2)
-        rsl_f_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        rsl_f_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        # Строка 2: AWL и PL
-        lamp_row2 = ttk.Frame(lamps_frame)
-        lamp_row2.pack(fill=tk.X, pady=2)
-        
-        # Левая часть (Байт 0)
-        left_frame2 = ttk.Frame(lamp_row2)
-        left_frame2.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        ttk.Label(left_frame2, text="AWL_L (2-3):", width=12).pack(side=tk.LEFT)
-        awl_l_combo = ttk.Combobox(left_frame2, textvariable=self.lamp_vars['AWL_L'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        awl_l_combo.pack(side=tk.LEFT, padx=2)
-        awl_l_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        awl_l_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        ttk.Label(left_frame2, text="PL_L (0-1):", width=12).pack(side=tk.LEFT, padx=(10, 2))
-        pl_l_combo = ttk.Combobox(left_frame2, textvariable=self.lamp_vars['PL_L'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        pl_l_combo.pack(side=tk.LEFT, padx=2)
-        pl_l_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        pl_l_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        # Правая часть (Байт 1)
-        right_frame2 = ttk.Frame(lamp_row2)
-        right_frame2.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        ttk.Label(right_frame2, text="AWL_F (2-3):", width=12).pack(side=tk.LEFT)
-        awl_f_combo = ttk.Combobox(right_frame2, textvariable=self.lamp_vars['AWL_F'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        awl_f_combo.pack(side=tk.LEFT, padx=2)
-        awl_f_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        awl_f_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        ttk.Label(right_frame2, text="PL_F (0-1):", width=12).pack(side=tk.LEFT, padx=(10, 2))
-        pl_f_combo = ttk.Combobox(right_frame2, textvariable=self.lamp_vars['PL_F'], 
-                                values=["0b00", "0b01", "0b10", "0b11"], width=5, state="readonly")
-        pl_f_combo.pack(side=tk.LEFT, padx=2)
-        pl_f_combo.bind('<<ComboboxSelected>>', self.on_lamp_changed)
-        pl_f_combo.set("0b11")  # Устанавливаем начальное значение
-        
-        # Отображение текущих байтов лампочек
         lamp_preview_frame = ttk.Frame(lamps_frame)
         lamp_preview_frame.pack(fill=tk.X, pady=(10, 0))
         
         ttk.Label(lamp_preview_frame, text="Текущие байты:").pack(side=tk.LEFT, padx=5)
-        self.lamp_preview_label = ttk.Label(lamp_preview_frame, text="Байт0: 0xFF  Байт1: 0xFF", 
+        self.lamp_preview_label = ttk.Label(lamp_preview_frame, text="Байт1: 0xFF  Байт2: 0xFF", 
                                             font=("Courier", 10, "bold"), foreground="darkblue")
         self.lamp_preview_label.pack(side=tk.LEFT, padx=10)
         
-        ttk.Button(lamp_preview_frame, text="Сбросить в FF", command=self.reset_lamps).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(lamp_preview_frame, text="Сбросить", command=self.reset_lamps).pack(side=tk.RIGHT, padx=5)
         
         # === Секция добавления ошибок ===
         add_frame = ttk.LabelFrame(main_frame, text="Добавить ошибку", padding="10")
@@ -584,34 +636,40 @@ class DM1SimulatorGUI:
         list_container = ttk.Frame(list_frame)
         list_container.pack(fill=tk.BOTH, expand=True)
         
-        columns = ("#", "SPN", "FMI", "Данные (hex)")
-        self.errors_tree = ttk.Treeview(list_container, columns=columns, show="headings", height=8)
+        columns = ("#", "SPN", "FMI", "Данные (hex)", "Вкл")
+        self.errors_tree = ttk.Treeview(list_container, columns=columns, show="headings", height=9)
         
         self.errors_tree.heading("#", text="#")
         self.errors_tree.heading("SPN", text="SPN")
         self.errors_tree.heading("FMI", text="FMI")
         self.errors_tree.heading("Данные (hex)", text="Данные (hex)")
+        self.errors_tree.heading("Вкл", text="Вкл")
         
+        # Устанавливаем ширину колонок
         self.errors_tree.column("#", width=40, anchor=tk.CENTER)
         self.errors_tree.column("SPN", width=100, anchor=tk.CENTER)
         self.errors_tree.column("FMI", width=80, anchor=tk.CENTER)
         self.errors_tree.column("Данные (hex)", width=200, anchor=tk.CENTER)
+        self.errors_tree.column("Вкл", width=50, anchor=tk.CENTER)
         
-        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.errors_tree.yview)
-        self.errors_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar_tree = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.errors_tree.yview)
+        self.errors_tree.configure(yscrollcommand=scrollbar_tree.set)
         
         self.errors_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_tree.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Двойной клик для переключения статуса ошибки
+        self.errors_tree.bind("<Double-1>", self.toggle_dtc_from_tree)
         
         btn_frame = ttk.Frame(list_frame)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
         
-        ttk.Button(btn_frame, text="Удалить", command=self.remove_selected_error, width=15).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Очистить", command=self.clear_errors, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Удалить", command=self.remove_selected_error, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Очистить", command=self.clear_errors, width=12).pack(side=tk.LEFT, padx=2)
         
         self.errors_enabled_var = tk.BooleanVar(value=True)
         self.errors_toggle_btn = ttk.Button(btn_frame, text="Выключить", 
-                                            command=self.toggle_errors_enabled, width=15)
+                                            command=self.toggle_errors_enabled, width=12)
         self.errors_toggle_btn.pack(side=tk.LEFT, padx=2)
         
         ttk.Button(btn_frame, text="💾 Сохранить", command=self.save_list, width=13).pack(side=tk.RIGHT, padx=2)
@@ -645,10 +703,13 @@ class DM1SimulatorGUI:
     def reset_lamps(self):
         """Сброс всех лампочек в значение 3 (FF)"""
         for key in self.lamp_vars:
-            self.lamp_vars[key].set("0b11")  # Изменено с "3" на "0b11"
+            self.lamp_vars[key].set("0b00")
+        # Обновляем чекбоксы
+        self.lamp_widget.update_checkboxes_from_values()
+        # Обновляем значения в simulator
         self.update_lamp_values()
         self.update_lamp_preview()
-        self.status_bar.config(text="✅ Лампочки сброшены в FF")
+        self.status_bar.config(text="✅ Лампочки сброшены в 00")
     
     def on_lamp_changed(self, event=None):
         self.update_lamp_values()
@@ -658,21 +719,19 @@ class DM1SimulatorGUI:
         for key, var in self.lamp_vars.items():
             value_str = var.get()
             if value_str:
-                # Парсим значение из "0bXX" формата
                 if value_str.startswith("0b"):
-                    value = int(value_str[2:], 2)  # Преобразуем бинарную строку в число
+                    value = int(value_str[2:], 2)
                 else:
-                    # Если вдруг сохранился старый формат
                     try:
                         value = int(value_str)
                     except ValueError:
-                        value = 3  # Значение по умолчанию
+                        value = 3
                 self.simulator.set_lamp_value(key, value)
     
     def update_lamp_preview(self):
         self.update_lamp_values()
         byte0, byte1 = self.simulator.get_lamp_bytes()
-        self.lamp_preview_label.config(text=f"Байт0: 0x{byte0:02X}  Байт1: 0x{byte1:02X}")
+        self.lamp_preview_label.config(text=f"Байт1: 0x{byte0:02X}  Байт2: 0x{byte1:02X}")
     
     def toggle_errors_enabled(self):
         self.simulator.set_errors_enabled(not self.simulator.errors_enabled)
@@ -687,6 +746,32 @@ class DM1SimulatorGUI:
         else:
             self.errors_toggle_btn.config(text="Включить")
             self.errors_status_label.config(text="🔴 Выключен", foreground="red")
+    
+    def toggle_selected_dtc(self):
+        """Переключение статуса выбранной ошибки"""
+        selected = self.errors_tree.selection()
+        if not selected:
+            messagebox.showinfo("Информация", "Выберите ошибку для переключения")
+            return
+        
+        item = selected[0]
+        # Сохраняем индекс до обновления
+        index = self.errors_tree.index(item)
+        
+        if self.simulator.toggle_dtc_enabled(index):
+            self.update_error_list()
+            # Восстанавливаем выделение на той же строке
+            children = self.errors_tree.get_children()
+            if index < len(children):
+                self.errors_tree.selection_set(children[index])
+                self.errors_tree.focus(children[index])
+            dtc = self.simulator.dtc_list[index]
+            status = "включена" if dtc.enabled else "выключена"
+            self.status_bar.config(text=f"✅ Ошибка #{index+1} {status}")
+    
+    def toggle_dtc_from_tree(self, event):
+        """Обработка двойного клика по строке списка"""
+        self.toggle_selected_dtc()
     
     def save_list(self):
         filename = filedialog.asksaveasfilename(
@@ -708,11 +793,11 @@ class DM1SimulatorGUI:
         )
         if filename:
             if self.simulator.load_from_file(filename):
-                # Преобразуем числа в строки с префиксом "0b"
                 for key, value in self.simulator.lamp_status.items():
-                    # value: 0 -> "0b00", 1 -> "0b01", 2 -> "0b10", 3 -> "0b11"
                     binary_str = f"0b{value:02b}"
                     self.lamp_vars[key].set(binary_str)
+                # Обновляем чекбоксы
+                self.lamp_widget.update_checkboxes_from_values()
                 self.update_lamp_preview()
                 self.update_error_list()
                 self.update_errors_status()
@@ -727,6 +812,8 @@ class DM1SimulatorGUI:
                 for key, value in self.simulator.lamp_status.items():
                     binary_str = f"0b{value:02b}"
                     self.lamp_vars[key].set(binary_str)
+                # Обновляем чекбоксы
+                self.lamp_widget.update_checkboxes_from_values()
                 self.update_lamp_preview()
                 self.update_error_list()
                 self.update_errors_status()
@@ -738,20 +825,22 @@ class DM1SimulatorGUI:
             dtc_list = self.simulator.dtc_list.copy()
             errors_enabled = self.simulator.errors_enabled
         
+        enabled_dtc = [dtc for dtc in dtc_list if dtc.enabled]
         count = len(dtc_list)
+        enabled_count = len(enabled_dtc)
         
         if not errors_enabled:
             mode = "🔴 СПИСОК ВЫКЛЮЧЕН - отправляется нулевое сообщение"
-        elif count == 0:
-            mode = "нет ошибок (SPN=0, FMI=0)"
-        elif count == 1:
+        elif enabled_count == 0:
+            mode = "нет включенных ошибок (SPN=0, FMI=0)"
+        elif enabled_count == 1:
             mode = "одиночное сообщение"
         else:
-            total_bytes = 2 + count * 4
+            total_bytes = 2 + enabled_count * 4
             total_packets = (total_bytes + 6) // 7
-            mode = f"BAM ({count} ошибок, {total_packets} пакетов)"
+            mode = f"BAM ({enabled_count} ошибок, {total_packets} пакетов)"
         
-        self.info_label.config(text=f"Ошибок: {count} | Режим: {mode}")
+        self.info_label.config(text=f"Ошибок: {count} (вкл: {enabled_count}) | Режим: {mode}")
         
         if count >= 400:
             self.limit_label.config(text=f"⚠️ {count}/445", foreground="red")
@@ -915,6 +1004,13 @@ class DM1SimulatorGUI:
             self.status_bar.config(text="🧹 Список ошибок очищен")
     
     def update_error_list(self):
+        # Сохраняем текущее выделение
+        selected_items = self.errors_tree.selection()
+        selected_index = None
+        if selected_items:
+            selected_index = self.errors_tree.index(selected_items[0])
+        
+        # Очищаем список
         for item in self.errors_tree.get_children():
             self.errors_tree.delete(item)
         
@@ -922,10 +1018,21 @@ class DM1SimulatorGUI:
             dtc_list = self.simulator.dtc_list.copy()
             errors_enabled = self.simulator.errors_enabled
         
-        for idx, dtc in enumerate(dtc_list, 1):
+        # Сортируем для отображения
+        dtc_list_sorted = sorted(dtc_list, key=lambda x: (x.spn, x.fmi))
+        
+        for idx, dtc in enumerate(dtc_list_sorted, 1):
             dtc_bytes = DTC(spn=dtc.spn, fmi=dtc.fmi).to_bytes()
             hex_str = ' '.join([f'{b:02X}' for b in dtc_bytes])
-            self.errors_tree.insert("", tk.END, values=(idx, dtc.spn, dtc.fmi, hex_str))
+            status = "✅" if dtc.enabled else "❌"
+            self.errors_tree.insert("", tk.END, values=(idx, dtc.spn, dtc.fmi, hex_str, status))
+        
+        # Восстанавливаем выделение
+        if selected_index is not None:
+            children = self.errors_tree.get_children()
+            if selected_index < len(children):
+                self.errors_tree.selection_set(children[selected_index])
+                self.errors_tree.focus(children[selected_index])
         
         self.update_send_mode_info()
         self.update_errors_status()
