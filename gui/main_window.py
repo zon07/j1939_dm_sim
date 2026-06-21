@@ -253,11 +253,13 @@ class MainWindow:
         self.lamp_widget.update_checkboxes_from_values()
         self.update_lamp_values()
         self.update_lamp_preview()
+        self.simulator.auto_save()
         self.status_bar.config(text="✅ Лампочки сброшены в 00")
     
     def on_lamp_changed(self, event=None):
         self.update_lamp_values()
         self.update_lamp_preview()
+        self.simulator.auto_save()
     
     def update_lamp_values(self):
         for key, var in self.lamp_vars.items():
@@ -282,6 +284,7 @@ class MainWindow:
     def toggle_errors_enabled(self):
         self.simulator.set_errors_enabled(not self.simulator.errors_enabled)
         self.update_errors_status()
+        self.simulator.auto_save()
         self.status_bar.config(text=f"Список ошибок: {'🟢 Включен' if self.simulator.errors_enabled else '🔴 Выключен'}")
         self.update_error_list()
     
@@ -304,6 +307,7 @@ class MainWindow:
         
         if self.simulator.toggle_dtc_enabled(index):
             self.update_error_list()
+            self.simulator.auto_save()
             children = self.errors_tree.get_children()
             if index < len(children):
                 self.errors_tree.selection_set(children[index])
@@ -557,6 +561,7 @@ class MainWindow:
         success, msg = self.simulator.add_dtc(spn, fmi)
         if success:
             self.update_error_list()
+            self.simulator.auto_save()
             self.spn_var.set("0")
             self.fmi_var.set("0")
             self.status_bar.config(text=f"✅ Добавлена ошибка SPN={spn}, FMI={fmi}")
@@ -574,12 +579,14 @@ class MainWindow:
         
         if self.simulator.remove_dtc(index):
             self.update_error_list()
+            self.simulator.auto_save()
             self.status_bar.config(text="✅ Ошибка удалена")
     
     def clear_errors(self):
         if self.simulator.dtc_list:
             self.simulator.clear_dtc()
             self.update_error_list()
+            self.simulator.auto_save()
             self.status_bar.config(text="🧹 Список ошибок очищен")
     
     # ============ Диалоги ============

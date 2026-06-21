@@ -337,6 +337,14 @@ class DM1Simulator:
             print(f"Ошибка сохранения: {e}")
             return False
     
+    def auto_save(self):
+        """Автоматическое сохранение в DEFAULT_SAVE_FILE"""
+        if self.save_to_file(DEFAULT_SAVE_FILE):
+            # Не выводить сообщение, чтобы не засорять статусбар
+            pass
+        else:
+            print(f"⚠️ Ошибка автосохранения в {DEFAULT_SAVE_FILE}")
+
     def load_from_file(self, filename: str) -> bool:
         """Загрузка списка ошибок и настроек лампочек из файла JSON"""
         try:
@@ -353,40 +361,4 @@ class DM1Simulator:
             return True
         except Exception as e:
             print(f"Ошибка загрузки: {e}")
-            return False
-
-
-class ConfigManager:
-    """Управление настройками приложения"""
-    
-    @staticmethod
-    def load_config() -> dict:
-        """Загрузка конфигурации из файла"""
-        default_config = {
-            "window_geometry": "610x800+100+50",
-            "last_channel": "",
-            "last_bitrate": "250000",
-            "last_sa": "0x00"
-        }
-        
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    # Обновляем дефолтные значения из загруженных
-                    default_config.update(config)
-        except Exception as e:
-            print(f"Ошибка загрузки конфига: {e}")
-        
-        return default_config
-    
-    @staticmethod
-    def save_config(config: dict):
-        """Сохранение конфигурации в файл"""
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            print(f"Ошибка сохранения конфига: {e}")
             return False
