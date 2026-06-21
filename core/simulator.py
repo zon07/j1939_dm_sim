@@ -2,6 +2,7 @@
 """Имитатор ошибок DM1 для PCAN"""
 
 import can
+import can.interfaces.pcan
 import time
 import threading
 import json
