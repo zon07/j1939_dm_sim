@@ -62,15 +62,7 @@ class MainWindow:
     
     def create_menu(self):
         """Создание главного меню"""
-        menubar = tk.Menu(
-            self.root,
-            bg='#f0f0f0',
-            fg='#000000',
-            activebackground='#cce8ff',
-            activeforeground='#000000',
-            relief='raised',
-            bd=1
-        )
+        menubar = tk.Menu(self.root,)
         self.root.config(menu=menubar)
         
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -81,16 +73,17 @@ class MainWindow:
     
     def create_widgets(self):
         """Создание виджетов"""
-        # Контейнер для основного содержимого
+        # === Главный контейнер с frame для растягивания ===
+        # Создаем основной контейнер, который будет занимать все место кроме статусбара
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True)
         
-        # Основной фрейм
-        main_frame = ttk.Frame(main_container, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # Основной фрейм с прокруткой (если понадобится)
+        self.main_frame = ttk.Frame(main_container, padding="10")
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
         
         # === Секция подключения ===
-        conn_frame = ttk.LabelFrame(main_frame, text="Подключение к PCAN", padding="10")
+        conn_frame = ttk.LabelFrame(self.main_frame, text="Подключение к PCAN", padding="10")
         conn_frame.pack(fill=tk.X, pady=5)
         
         row1 = ttk.Frame(conn_frame)
@@ -111,7 +104,7 @@ class MainWindow:
         self.connect_btn.pack(side=tk.LEFT, padx=10)
         
         # === Секция SA ===
-        sa_frame = ttk.LabelFrame(main_frame, text="Настройка SA", padding="10")
+        sa_frame = ttk.LabelFrame(self.main_frame, text="Настройка SA", padding="10")
         sa_frame.pack(fill=tk.X, pady=5)
         
         row2 = ttk.Frame(sa_frame)
@@ -138,7 +131,7 @@ class MainWindow:
         self.sa_combo.bind('<<ComboboxSelected>>', self.on_sa_changed)
         
         # === Секция лампочек ===
-        lamps_frame = ttk.LabelFrame(main_frame, text="DM1 Lamp Status (первые 2 байта)", padding="10")
+        lamps_frame = ttk.LabelFrame(self.main_frame, text="DM1 Lamp Status (первые 2 байта)", padding="10")
         lamps_frame.pack(fill=tk.X, pady=5)
         
         lamps_container = ttk.Frame(lamps_frame)
@@ -157,7 +150,7 @@ class MainWindow:
         ttk.Button(lamp_preview_frame, text="Сбросить", command=self.reset_lamps).pack(side=tk.RIGHT, padx=5)
         
         # === Секция добавления ошибок ===
-        add_frame = ttk.LabelFrame(main_frame, text="Добавить ошибку", padding="10")
+        add_frame = ttk.LabelFrame(self.main_frame, text="Добавить ошибку", padding="10")
         add_frame.pack(fill=tk.X, pady=5)
         
         row3 = ttk.Frame(add_frame)
@@ -177,7 +170,7 @@ class MainWindow:
         self.limit_label.pack(side=tk.LEFT, padx=10)
         
         # === Секция списка ошибок ===
-        list_frame = ttk.LabelFrame(main_frame, text="Список ошибок", padding="10")
+        list_frame = ttk.LabelFrame(self.main_frame, text="Список ошибок", padding="10")
         list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         list_container = ttk.Frame(list_frame)
@@ -222,7 +215,7 @@ class MainWindow:
         self.errors_status_label = ttk.Label(btn_frame, text="🟢 Включен", foreground="green")
         self.errors_status_label.pack(side=tk.LEFT, padx=10)
         
-        info_frame = ttk.Frame(main_frame)
+        info_frame = ttk.Frame(self.main_frame)
         info_frame.pack(fill=tk.X, pady=5)
         
         self.info_label = ttk.Label(info_frame, text="Ошибок: 0 | Режим: нет ошибок (SPN=0, FMI=0)", foreground="blue")
@@ -231,7 +224,15 @@ class MainWindow:
         self.send_count_label = ttk.Label(info_frame, text="Отправлено: 0", foreground="green")
         self.send_count_label.pack(side=tk.RIGHT)
         
-        # === Статус бар ===
+        # === Статус бар (всегда внизу, не перекрывается) ===
+        self.create_status_bar()
+        
+        self.update_lamp_preview()
+    
+    def create_status_bar(self):
+        """Создание статус бара внизу окна"""
+        # Статус бар размещается в корневом окне, но после основного контейнера
+        # с fill=tk.X и side=tk.BOTTOM, чтобы он всегда был внизу
         status_frame = ttk.Frame(self.root)
         status_frame.pack(side=tk.BOTTOM, fill=tk.X)
         
@@ -240,8 +241,6 @@ class MainWindow:
         
         version_label = ttk.Label(status_frame, text=f"v{self.version}", relief=tk.SUNKEN, anchor=tk.E, width=10)
         version_label.pack(side=tk.RIGHT, fill=tk.X)
-        
-        self.update_lamp_preview()
     
     def set_status(self, message: str):
         """Установка статуса"""
