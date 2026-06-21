@@ -73,13 +73,15 @@ class MainWindow:
     
     def create_widgets(self):
         """Создание виджетов"""
-        # === Главный контейнер с frame для растягивания ===
-        # Создаем основной контейнер, который будет занимать все место кроме статусбара
+        # === Главный контейнер (заполняет всё окно) ===
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True)
         
-        # Основной фрейм с прокруткой (если понадобится)
-        self.main_frame = ttk.Frame(main_container, padding="10")
+        # === Контент (занимает всё место кроме статусбара) ===
+        content_frame = ttk.Frame(main_container)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.main_frame = ttk.Frame(content_frame, padding="10")
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
         # === Секция подключения ===
@@ -224,15 +226,12 @@ class MainWindow:
         self.send_count_label = ttk.Label(info_frame, text="Отправлено: 0", foreground="green")
         self.send_count_label.pack(side=tk.RIGHT)
         
-        # === Статус бар (всегда внизу, не перекрывается) ===
         self.create_status_bar()
         
         self.update_lamp_preview()
-    
+
     def create_status_bar(self):
         """Создание статус бара внизу окна"""
-        # Статус бар размещается в корневом окне, но после основного контейнера
-        # с fill=tk.X и side=tk.BOTTOM, чтобы он всегда был внизу
         status_frame = ttk.Frame(self.root)
         status_frame.pack(side=tk.BOTTOM, fill=tk.X)
         
